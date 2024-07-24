@@ -3,33 +3,20 @@
 #   This makefile was adapted from: https://github.com/vincentbernat/hellogopher/blob/feature/glide/Makefile
 #
 # Go environment
-GOPATH=$(CURDIR)/.gopath
-GOBIN=$(CURDIR)/bin
-# Go tools
-GOLINT = $(GOBIN)/golint
-GOCOVMERGE = $(GOBIN)/gocovmerge
-GOCOV = $(GOBIN)/gocov
-GOCOVXML = $(GOBIN)/gocov-xml
-GCOV2LCOV = $(GOBIN)/gcov2lcov
-GO2XUNIT = $(GOBIN)/go2xunit
-GOMOCKERY = $(GOBIN)/mockery
-# Package info
-BINARY_NAME=sriovdp
-PACKAGE=sriov-network-device-plugin
-ORG_PATH=github.com/k8snetworkplumbingwg
+export GOPATH?=$(shell go env GOPATH)
+BINDIR=$(CURDIR)/bin
 # Build info
+BINARY_NAME=sriovdp
 BUILDDIR=$(CURDIR)/build
 REPO_PATH=$(ORG_PATH)/$(PACKAGE)
 BASE=$(GOPATH)/src/$(REPO_PATH)
 PKGS = $(or $(PKG),$(shell cd $(BASE) && env GOPATH=$(GOPATH) go list ./... | grep -v "^$(PACKAGE)/vendor/"))
 GOFILES = $(shell find . -name *.go | grep -vE "(\/vendor\/)|(_test.go)")
 # Test artifacts and settings
-TESTPKGS = $(shell env GOPATH=$(GOPATH) go list -f '{{ if or .TestGoFiles .XTestGoFiles }}{{ .ImportPath }}{{ end }}' $(PKGS))
 TIMEOUT = 15
+COVERAGE_DIR = $(CURDIR)/test/coverage
 COVERAGE_MODE = atomic
-COVERAGE_PROFILE = $(COVERAGE_DIR)/profile.out
-COVERAGE_XML = $(COVERAGE_DIR)/coverage.xml
-COVERAGE_HTML = $(COVERAGE_DIR)/index.html
+COVERAGE_PROFILE = $(COVERAGE_DIR)/cover.out
 # Docker image
 DOCKERFILE?=$(CURDIR)/images/Dockerfile
 TAG?=ghcr.io/k8snetworkplumbingwg/sriov-network-device-plugin
@@ -42,36 +29,40 @@ ifdef HTTPS_PROXY
 	DOCKERARGS += --build-arg https_proxy=$(HTTPS_PROXY)
 endif
 
-LDFLAGS=
-ifdef STATIC
-	export CGO_ENABLED=0
-	LDFLAGS=-a -ldflags '-extldflags \"-static\"'
-endif
+GO_BUILD_OPTS ?=
+GO_LDFLAGS ?=
+GO_FLAGS ?=
 
-export GOPATH
-export GOBIN
+ifdef STATIC
+	GO_BUILD_OPTS+= CGO_ENABLED=0
+	GO_LDFLAGS+= -extldflags \"-static\"
+	GO_FLAGS+= -a
+endif
 
 V = 0
 Q = $(if $(filter 1,$V),,@)
 
 .PHONY: all
-all: fmt lint build
+all: lint build test
 
-$(BASE): ; $(info  Setting GOPATH...)
-	@mkdir -p $(dir $@)
-	@ln -sf $(CURDIR) $@
+.PHONY: create-dirs
+create-dirs: $(BINDIR) $(BUILDDIR) $(COVERAGE_DIR)
 
-$(GOBIN):
-	@mkdir -p $@
+$(BINDIR) $(BUILDDIR) $(COVERAGE_DIR): ; $(info Creating directory $@...)
+	$Q mkdir -p $@
 
-$(BUILDDIR): | $(BASE) ; $(info Creating build directory...)
-	@cd $(BASE) && mkdir -p $@
-
-build: $(BUILDDIR)/$(BINARY_NAME) | ; $(info Building $(BINARY_NAME)...) @ ## Build SR-IOV Network device plugin
+.PHONY: build
+build: | $(BUILDDIR) ; $(info Building $(BINARY_NAME)...) @ ## Build SR-IOV Network device plugin
+	$Q cd $(CURDIR)/cmd/$(BINARY_NAME) && $(GO_BUILD_OPTS) go build -ldflags '$(GO_LDFLAGS)' $(GO_FLAGS) -o $(BUILDDIR)/$(BINARY_NAME) -tags no_openssl -v
 	$(info Done!)
 
-$(BUILDDIR)/$(BINARY_NAME): $(GOFILES) | $(BUILDDIR)
-	@cd $(BASE)/cmd/$(BINARY_NAME) && CGO_ENABLED=0 go build $(LDFLAGS) -o $(BUILDDIR)/$(BINARY_NAME) -tags no_openssl -v
+GOLANGCI_LINT = $(BINDIR)/golangci-lint
+GOLANGCI_LINT_VERSION ?= v1.55.2
+$(GOLANGCI_LINT): | $(BINDIR) ; $(info  installing golangci-lint...)
+	$Q[ -f $(GOLANGCI_LINT) ] || { \
+	set -e ;\
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(shell dirname $(GOLANGCI_LINT)) $(GOLANGCI_LINT_VERSION) ;\
+	}
 
 $(GOLINT): | $(BASE) ; $(info  building golint...)
 	$Q go install golang.org/x/lint/golint@latest
@@ -102,8 +93,8 @@ test-verbose: ARGS=-v            ## Run tests in verbose mode with coverage repo
 test-race:    ARGS=-race         ## Run tests with race detector
 $(TEST_TARGETS): NAME=$(MAKECMDGOALS:test-%=%)
 $(TEST_TARGETS): test
-check test tests: fmt lint | $(BASE) ; $(info  running $(NAME:%=% )tests...) @ ## Run tests
-	$Q cd $(BASE) && go test -timeout $(TIMEOUT)s $(ARGS) $(TESTPKGS)
+test: ; $(info  running $(NAME:%=% )tests...) @ ## Run tests
+	$Q go test -timeout $(TIMEOUT)s $(ARGS) $(PKGS)
 
 test-xml: fmt lint | $(BASE) $(GO2XUNIT) ; $(info  running $(NAME:%=% )tests...) @ ## Run tests with xUnit output
 	$Q cd $(BASE) && 2>&1 go test -timeout 20s -v $(TESTPKGS) | tee test/tests.output
@@ -144,23 +135,21 @@ deps-update: ; $(info  Updating dependencies...) @ ## Update dependencies
 	@go mod tidy && go mod vendor
 
 .PHONY: image
-image: | $(BASE) ; $(info Building Docker image...) @ ## Build SR-IOV Network device plugin docker image
-	@docker build -t $(TAG) -f $(DOCKERFILE)  $(CURDIR) $(DOCKERARGS)
+image: ; $(info Building Docker image...) @ ## Build SR-IOV Network device plugin docker image
+	$Q docker build -t $(TAG) -f $(DOCKERFILE)  $(CURDIR) $(DOCKERARGS)
 
 .PHONY: clean
 clean: ; $(info  Cleaning...) @ ## Cleanup everything
 	@go clean --modcache --cache --testcache
-	@rm -rf $(GOPATH)
 	@rm -rf $(BUILDDIR)
-	@rm -rf $(GOBIN)
+	@rm -rf $(BINDIR)
 	@rm -rf test/
 
-.PHONY: mockery
-mockery: | $(BASE) $(GOMOCKERY) ; $(info  Running mockery...) @ ## Run golint on all source files
-#	$Q cd $(BASE)/pkg/types && rm -rf mocks && $(GOMOCKERY) --all 2>/dev/null
-	$Q $(GOMOCKERY) --name=".*" --dir=pkg/types --output=pkg/types/mocks --recursive=false --log-level=debug
-	$Q $(GOMOCKERY) --name=".*" --dir=pkg/utils --output=pkg/utils/mocks --recursive=false --log-level=debug
-	$Q $(GOMOCKERY) --name=".*" --dir=pkg/cdi --output=pkg/cdi/mocks --recursive=false --log-level=debug
+.PHONY: generate-mocks
+generate-mocks: | $(MOCKERY) ; $(info generating mocks...) @ ## Generate mocks
+	$Q $(MOCKERY) --name=".*" --dir=pkg/types --output=pkg/types/mocks --recursive=false --log-level=debug
+	$Q $(MOCKERY) --name=".*" --dir=pkg/utils --output=pkg/utils/mocks --recursive=false --log-level=debug
+	$Q $(MOCKERY) --name=".*" --dir=pkg/cdi --output=pkg/cdi/mocks --recursive=false --log-level=debug
 
 .PHONY: help
 help: ; @ ## Display this help message
